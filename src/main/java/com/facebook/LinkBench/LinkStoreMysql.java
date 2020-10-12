@@ -19,17 +19,9 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
 import java.nio.charset.Charset;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.Collections;
+import java.sql.*;
+import java.util.*;
 import java.util.Date;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Properties;
-import java.util.Random;
 
 import org.apache.log4j.Level;
 import org.apache.log4j.Logger;
@@ -59,10 +51,16 @@ public class LinkStoreMysql extends GraphStore {
   String defaultDB;
 
   Level debuglevel;
+
+  private boolean usePreparedStatements;
+
   // Use read-only and read-write connections and statements to avoid toggling
   // auto-commit.
   Connection conn_ro, conn_rw;
   Statement stmt_ro, stmt_rw;
+  private PreparedStatement getNodeStatement;
+  private PreparedStatement getLinkListStatement;
+  private PreparedStatement countLinksStatement;
 
   private Phase phase;
 
@@ -118,6 +116,10 @@ public class LinkStoreMysql extends GraphStore {
                                       CONFIG_DISABLE_BINLOG_LOAD);
     }
 
+    usePreparedStatements = ConfigUtil.getBool(props, "use_prepared_statements", false);
+
+    linktable = ConfigUtil.getPropertyRequired(props, Config.LINK_TABLE);
+
     // connect
     try {
       openConnection();
@@ -126,7 +128,6 @@ public class LinkStoreMysql extends GraphStore {
       throw e;
     }
 
-    linktable = ConfigUtil.getPropertyRequired(props, Config.LINK_TABLE);
   }
 
   // connects to test database
@@ -134,6 +135,8 @@ public class LinkStoreMysql extends GraphStore {
     conn_ro = null;
     conn_rw = null;
     stmt_ro = null;
+    getNodeStatement = null;
+    getLinkListStatement = null;
     stmt_rw = null;
     Random rng = new Random();
 
@@ -142,15 +145,14 @@ public class LinkStoreMysql extends GraphStore {
       jdbcUrl += defaultDB;
     }
 
-    Class.forName("com.mysql.jdbc.Driver").newInstance();
-
     jdbcUrl += "?elideSetAutoCommits=true" +
                "&useLocalTransactionState=true" +
                "&allowMultiQueries=true" +
                "&useLocalSessionState=true" +
    /* Need affected row count from queries to distinguish updates/inserts
     * consistently across different MySql versions (see MySql bug 46675) */
-               "&useAffectedRows=true";
+               "&useAffectedRows=true" +
+               "&useServerPrepStmts=true";
 
     /* Fix for failing connections at high concurrency, short random delay for
      * each */
@@ -180,6 +182,36 @@ public class LinkStoreMysql extends GraphStore {
     stmt_ro = conn_ro.createStatement(ResultSet.TYPE_SCROLL_INSENSITIVE,
                                       ResultSet.CONCUR_READ_ONLY);
 
+    getNodeStatement = conn_ro.prepareStatement(
+            "SELECT id, type, version, time, data " +
+                    "FROM `" + defaultDB + "`.`" + nodetable + "` " +
+                    "WHERE id=?",
+              ResultSet.TYPE_SCROLL_INSENSITIVE,
+              ResultSet.CONCUR_READ_ONLY
+    );
+
+    getLinkListStatement = conn_ro.prepareStatement(
+            "select id1, id2, link_type," +
+                    " visibility, data, time," +
+                    " version from " + defaultDB + "." + linktable +
+                    " FORCE INDEX(`id1_type`) " +
+                    " where id1 = ? and link_type = ?" +
+                    " and time >= ?" +
+                    " and time <= ?" +
+                    " and visibility = " + LinkStore.VISIBILITY_DEFAULT +
+                    " order by time desc " +
+                    " limit ?,?",
+            ResultSet.TYPE_SCROLL_INSENSITIVE,
+            ResultSet.CONCUR_READ_ONLY
+    );
+
+    countLinksStatement = conn_ro.prepareStatement(
+            "select count from " + defaultDB + "." + counttable +
+                    " where id = ? and link_type = ?",
+            ResultSet.TYPE_SCROLL_INSENSITIVE,
+            ResultSet.CONCUR_READ_ONLY
+    );
+
     if (phase == Phase.LOAD && disableBinLogForLoad) {
       // Turn binary logging off for duration of connection
       stmt_rw.executeUpdate("SET SESSION sql_log_bin=0");
@@ -192,6 +224,9 @@ public class LinkStoreMysql extends GraphStore {
     try {
       if (stmt_rw != null) stmt_rw.close();
       if (stmt_ro != null) stmt_ro.close();
+      if (getNodeStatement != null) getNodeStatement.close();
+      if (getLinkListStatement != null) getLinkListStatement.close();
+      if (countLinksStatement != null) countLinksStatement.close();
       if (conn_rw != null) conn_rw.close();
       if (conn_ro != null) conn_ro.close();
     } catch (SQLException e) {
@@ -694,8 +729,13 @@ public class LinkStoreMysql extends GraphStore {
     throws Exception {
     while (true) {
       try {
-        return getLinkListImpl(dbid, id1, link_type, minTimestamp,
-                               maxTimestamp, offset, limit);
+        if (usePreparedStatements && defaultDB.equals(dbid)) {
+          return getLinkListImplPrepared(id1, link_type, minTimestamp,
+                  maxTimestamp, offset, limit);
+        } else {
+          return getLinkListImpl(dbid, id1, link_type, minTimestamp,
+                  maxTimestamp, offset, limit);
+        }
       } catch (SQLException ex) {
         if (!processSQLException(ex, "getLinkListImpl")) {
           throw ex;
@@ -724,7 +764,26 @@ public class LinkStoreMysql extends GraphStore {
     }
 
     ResultSet rs = stmt_ro.executeQuery(query);
+    return getLinkListImpl(id1, link_type, rs);
+  }
 
+  private Link[] getLinkListImplPrepared(long id1, long link_type,
+                                 long minTimestamp, long maxTimestamp,
+                                 int offset, int limit) throws Exception {
+
+    getLinkListStatement.setLong(1, id1);
+    getLinkListStatement.setLong(2, link_type);
+    getLinkListStatement.setLong(3, minTimestamp);
+    getLinkListStatement.setLong(4, maxTimestamp);
+    getLinkListStatement.setInt(5, offset);
+    getLinkListStatement.setInt(6, limit);
+
+    ResultSet rs = getLinkListStatement.executeQuery();
+
+    return getLinkListImpl(id1, link_type, rs);
+  }
+
+  private Link[] getLinkListImpl(long id1, long link_type, ResultSet rs) throws SQLException {
     // Find result set size
     // be sure we fast forward to find result set size
     assert(rs.getType() != ResultSet.TYPE_FORWARD_ONLY);
@@ -770,7 +829,11 @@ public class LinkStoreMysql extends GraphStore {
     throws Exception {
     while (true) {
       try {
-        return countLinksImpl(dbid, id1, link_type);
+        if (usePreparedStatements && dbid.equals(defaultDB)) {
+          return countLinksImplPrepared(id1, link_type);
+        } else {
+          return countLinksImpl(dbid, id1, link_type);
+        }
       } catch (SQLException ex) {
         if (!processSQLException(ex, "countLinks")) {
           throw ex;
@@ -781,11 +844,27 @@ public class LinkStoreMysql extends GraphStore {
 
   private long countLinksImpl(String dbid, long id1, long link_type)
         throws Exception {
-    long count = 0;
     String query = " select count from " + dbid + "." + counttable +
                    " where id = " + id1 + " and link_type = " + link_type + ";";
 
     ResultSet rs = stmt_ro.executeQuery(query);
+
+    return countLinksImpl(id1, link_type, rs);
+  }
+
+  private long countLinksImplPrepared(long id1, long link_type)
+          throws Exception {
+
+    countLinksStatement.setLong(1, id1);
+    countLinksStatement.setLong(2, link_type);
+
+    ResultSet rs = countLinksStatement.executeQuery();
+
+    return countLinksImpl(id1, link_type, rs);
+  }
+
+  private long countLinksImpl(long id1, long link_type, ResultSet rs) throws SQLException {
+    long count = 0;
     boolean found = false;
 
     while (rs.next()) {
@@ -979,7 +1058,11 @@ public class LinkStoreMysql extends GraphStore {
   public Node getNode(String dbid, int type, long id) throws Exception {
     while (true) {
       try {
-        return getNodeImpl(dbid, type, id);
+        if (usePreparedStatements && dbid.equals(defaultDB)) {
+          return getNodeImplPrepared(type, id);
+        } else {
+          return getNodeImpl(dbid, type, id);
+        }
       } catch (SQLException ex) {
         if (!processSQLException(ex, "getNode")) {
           throw ex;
@@ -994,12 +1077,27 @@ public class LinkStoreMysql extends GraphStore {
       "SELECT id, type, version, time, data " +
       "FROM `" + dbid + "`.`" + nodetable + "` " +
       "WHERE id=" + id + ";");
+
+    return getNodeImpl(type, rs);
+  }
+
+  private Node getNodeImplPrepared(int type, long id) throws Exception {
+    checkNodeTableConfigured();
+
+    getNodeStatement.setLong(1, id);
+
+    ResultSet rs = getNodeStatement.executeQuery();
+
+    return getNodeImpl(type, rs);
+  }
+
+  private Node getNodeImpl(int type, ResultSet rs) throws SQLException {
     if (rs.next()) {
       Node res = new Node(rs.getLong(1), rs.getInt(2),
            rs.getLong(3), rs.getInt(4), rs.getBytes(5));
 
       // Check that multiple rows weren't returned
-      assert(rs.next() == false);
+      assert (rs.next() == false);
       rs.close();
       if (res.type != type) {
         return null;
