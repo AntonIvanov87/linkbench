@@ -262,8 +262,18 @@ public class LinkBenchRequest implements Runnable {
     pc_getnode = pc_deletenode + ConfigUtil.getDouble(props, Config.PR_GET_NODE, 0.0);
 
     if (Math.abs(pc_getnode - 100.0) > 1e-5) {//compare real numbers
-      throw new LinkBenchConfigError("Percentages of request types do not " +
-                  "add to 100, only " + pc_getnode + "!");
+      double k = 100.0/pc_getnode;
+      pc_addlink *= k;
+      pc_deletelink *= k;
+      pc_updatelink *= k;
+      pc_countlink *= k;
+      pc_getlink *= k;
+      pc_getlinklist *=k;
+
+      pc_addnode *= k;
+      pc_updatenode *= k;
+      pc_deletenode *= k;
+      pc_getnode *= k;
     }
   }
 
